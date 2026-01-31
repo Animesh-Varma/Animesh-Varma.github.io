@@ -3,10 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>lab.animeshvarma.dev</title>
-
-    <!-- Favicon (Reused) -->
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22white%22><path d=%22M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z%22/></svg>">
+    <title>track.animeshvarma.dev</title>
 
     <!-- Typography & Icons -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -14,10 +11,11 @@
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,400,0,0" />
 
-    <!-- SortableJS for Drag & Drop -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
+    <!-- Core Libraries (Three.js + MediaPipe) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
 
-    <link rel="stylesheet" href="style.css?v=1.7">
+    <link rel="stylesheet" href="style.css?v=0.1">
     <script src="script.js" defer></script>
 </head>
 <body>
@@ -30,123 +28,49 @@
         <header class="top-bar">
             <div class="logo-section">
                 <a href="https://animeshvarma.dev" class="home-link">
-                    <h1><span class="highlight">lab</span>.animeshvarma.dev</h1>
+                    <h1><span class="highlight">track</span>.animeshvarma.dev</h1>
                 </a>
             </div>
+
             <div class="status-badge">
-                <div class="live-dot"></div>
-                <span id="systemStatus">ESTABLISHING UPLINK...</span>
-            </div>
-            <!-- Admin Controls (Hidden by default) -->
-            <div class="admin-controls hidden" id="adminControls">
-                <button class="icon-btn" onclick="openProjectModal()">
-                    <span class="material-symbols-rounded">add</span>
-                </button>
-                <button class="icon-btn danger" onclick="logout()">
-                    <span class="material-symbols-rounded">logout</span>
-                </button>
+                <div class="live-dot" id="statusDot"></div>
+                <span id="systemStatus">INITIALIZING CORE...</span>
             </div>
         </header>
 
-        <main>
+        <main id="main-viewport">
             <!-- Loading Overlay (Material 3 Animated Gradient) -->
             <div class="loading-overlay" id="loadingOverlay">
                 <div class="loader-content">
                     <svg class="md-spinner" viewBox="0 0 50 50">
                         <circle class="md-spinner-path" cx="25" cy="25" r="20" fill="none" stroke-width="4"></circle>
                     </svg>
-                    <span>ESTABLISHING UPLINK</span>
+                    <span class="blink">ESTABLISHING UPLINK</span>
+                    <span id="loadDetail" style="font-size: 0.7rem; opacity: 0.7;">Loading Neural Models...</span>
                 </div>
             </div>
 
-            <!-- Kanban Board -->
-            <div class="board-container">
+            <!-- 3D Canvas Container -->
+            <div id="canvas-container"></div>
 
-                <!-- Section: On Going -->
-                <div class="board-column">
-                    <div class="column-header" data-tooltip="Active development in Pre-Alpha to Beta stages. Expect frequent, potentially breaking changes and instability.">
-                        <span class="material-symbols-rounded">sync</span>
-                        <span>ON GOING</span>
-                    </div>
-                    <div class="card-list" id="ongoing"></div>
-                </div>
-
-                <!-- Section: Planned -->
-                <div class="board-column">
-                    <div class="column-header" data-tooltip="Concepts and designs phases completed, awaiting development.">
-                        <span class="material-symbols-rounded">pending</span>
-                        <span>PLANNED</span>
-                    </div>
-                    <div class="card-list" id="planned"></div>
-                </div>
-
-                <!-- Section: On Hold -->
-                <div class="board-column">
-                    <div class="column-header" data-tooltip="Temporarily paused. Development is scheduled to resume in the future.">
-                        <span class="material-symbols-rounded">pause_circle</span>
-                        <span>ON HOLD</span>
-                    </div>
-                    <div class="card-list" id="onhold"></div>
-                </div>
-
-                <!-- Section: STABLE -->
-                <div class="board-column">
-                    <div class="column-header" data-tooltip="Released, production-ready, and actively supported with updates and improvements.">
-                        <span class="material-symbols-rounded">check_circle</span>
-                        <span>STABLE</span>
-                    </div>
-                    <div class="card-list" id="stable"></div>
-                </div>
-
-                <!-- Section: Discontinued -->
-                <div class="board-column">
-                    <div class="column-header" data-tooltip="No longer actively supported; development has ceased. Free for public use and reference.">
-                        <span class="material-symbols-rounded">cancel</span>
-                        <span>DISCONTINUED</span>
-                    </div>
-                    <div class="card-list" id="discontinued"></div>
-                </div>
-
+            <!-- Latency HUD -->
+            <div class="hud-panel">
+                <span class="material-symbols-rounded" style="font-size: 14px;">speed</span>
+                <span>LATENCY: <span id="fpsCounter">0</span>ms</span>
             </div>
+
+            <!-- Input Feed (Hidden via opacity) -->
+            <video class="input_video" autoplay muted playsinline></video>
         </main>
 
         <footer>
             <p>
                 <a href="https://github.com/animesh-varma" target="_blank">GitHub</a> |
                 <a href="mailto:mail@animeshvarma.dev">Email</a> |
-                <a href="https://instagram.com/animesh_varma" target="_blank">Instagram</a> |
-                <a href="#" id="authLink">Access</a>
+                <a href="https://instagram.com/animesh_varma" target="_blank">Instagram</a>
             </p>
         </footer>
     </div>
 
-    <!-- Modals -->
-
-    <!-- Auth Modal -->
-    <div class="modal-overlay hidden" id="authModal">
-        <div class="modal-box">
-            <h3>Identify</h3>
-            <input type="password" id="adminPassword" placeholder="Enter Passkey..." class="modal-input">
-            <div class="modal-actions">
-                <button class="btn-text" onclick="closeModals()">Cancel</button>
-                <button class="btn-primary" onclick="authenticate()">Authorize</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- Project Edit/Add Modal -->
-    <div class="modal-overlay hidden" id="projectModal">
-        <div class="modal-box">
-            <h3 id="modalTitle">New Protocol</h3>
-            <input type="hidden" id="editId">
-            <input type="text" id="pTitle" placeholder="Project Name" class="modal-input">
-            <input type="text" id="pLink" placeholder="Hyperlink (URL)" class="modal-input">
-            <textarea id="pDesc" placeholder="Description (Hover text)..." class="modal-input area"></textarea>
-            <div class="modal-actions">
-                <button class="btn-text" onclick="closeModals()">Cancel</button>
-                <button class="btn-primary" onclick="saveProject()">Save</button>
-            </div>
-        </div>
-    </div>
 </body>
 </html>

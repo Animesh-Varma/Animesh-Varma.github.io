@@ -1,329 +1,245 @@
+// --- DOM References ---
+const videoElement = document.querySelector('.input_video');
+const canvasContainer = document.getElementById('canvas-container');
+const loadingOverlay = document.getElementById('loadingOverlay');
+const systemStatus = document.getElementById('systemStatus');
+const statusDot = document.getElementById('statusDot');
+const fpsCounter = document.getElementById('fpsCounter');
+const loadDetail = document.getElementById('loadDetail');
+const mainViewport = document.getElementById('main-viewport');
+
 // --- Configuration ---
+const CONFIG = {
+    UPDATE_INTERVAL: 20, // Target ~50fps for AI
+    HAND_COLOR: 0xFFFFFF, // White to match Lab Theme
+    MAX_HANDS: 2
+};
 
-// 1. Database URL
-// Replaced by Cloudflare Build Command: sed -i "s|__DB_URL__|$DB_URL|g" script.js
-const DB_URL = "__DB_URL__";
-
-// 2. Admin Hash
-// Replaced by Cloudflare Build Command: sed -i "s|__ADMIN_HASH__|$ADMIN_HASH|g" script.js
-const TARGET_HASH = "__ADMIN_HASH__";
-
-// 3. Fallback Data
-const EMBEDDED_DB = [
-    { id: '101', title: 'Lab Interface', link: 'https://lab.animeshvarma.dev', desc: 'The Kanban interface you are viewing right now.', section: 'ongoing' },
-    { id: '102', title: 'Upload Protocol', link: 'https://upload.animeshvarma.dev', desc: 'Secure file transmission protocol.', section: 'stable' }
+// --- Connection Map (23 connections) ---
+const connections = [
+    [0,1],[1,2],[2,3],[3,4],        // Thumb
+    [0,5],[5,6],[6,7],[7,8],        // Index
+    [0,9],[9,10],[10,11],[11,12],   // Middle
+    [0,13],[13,14],[14,15],[15,16], // Ring
+    [0,17],[17,18],[18,19],[19,20], // Pinky
+    [5,9],[9,13],[13,17]            // Palm
 ];
 
-// --- State ---
-const SECTIONS = ['ongoing', 'planned', 'onhold', 'stable', 'discontinued'];
-let projects = [];
-let isAuthenticated = false;
-let sessionToken = null;
-
-// DOM Elements (Initialized in setup)
-let systemStatus, liveDot, loadingOverlay, mainContent;
+// --- Globals ---
+let scene, camera, renderer;
+let handMeshes = [];
+let hands;
+let isProcessing = false;
+let lastLoopTime = 0;
 
 // --- Initialization ---
-document.addEventListener('DOMContentLoaded', async () => {
-    // Initialize DOM elements safely
-    systemStatus = document.getElementById('systemStatus');
-    liveDot = document.querySelector('.live-dot');
-    loadingOverlay = document.getElementById('loadingOverlay');
-    mainContent = document.querySelector('main');
+initThreeJS();
+initMediaPipe();
 
-    await loadData();
-    initDragAndDrop();
-    checkSession();
-});
+// 1. Setup 3D Environment
+function initThreeJS() {
+    scene = new THREE.Scene();
+    // Subtle fog to match the Lab surface container color
+    scene.fog = new THREE.FogExp2(0x111111, 0.02);
 
-// --- Data Synchronization ---
+    // Camera setup based on container size
+    const width = mainViewport.clientWidth;
+    const height = mainViewport.clientHeight;
 
-async function loadData() {
-    // 1. Sync Header Status with Overlay (Yellow/Processing)
-    if (systemStatus) systemStatus.innerText = "ESTABLISHING UPLINK...";
-    if (liveDot) {
-        liveDot.style.backgroundColor = "#FFFF00"; // Yellow
-        liveDot.style.boxShadow = "0 0 8px #FFFF00";
-    }
+    camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 1000);
+    camera.position.z = 25;
 
-    let cloudSuccess = false;
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
+    renderer.setSize(width, height);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    canvasContainer.appendChild(renderer.domElement);
 
-    if (DB_URL && DB_URL.startsWith('http')) {
-        try {
-            const response = await fetch(`${DB_URL}?t=${Date.now()}`);
-            if (!response.ok) throw new Error(response.status);
+    // Lighting
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
 
-            const json = await response.json();
-            if (json.data && Array.isArray(json.data)) {
-                projects = json.data;
-                cloudSuccess = true;
-            }
-        } catch (e) {
-            console.warn("Cloud Load Failed, using Embedded:", e);
-            const errCode = e.message === "Failed to fetch" ? "NETWORK" : e.message;
-            flashStatus(`ERROR ${errCode}`, "#ff4444");
+    // Grid Helper (Darker to blend with Lab theme)
+    const gridHelper = new THREE.GridHelper(60, 60, 0x333333, 0x000000);
+    gridHelper.position.y = -5;
+    scene.add(gridHelper);
+
+    // Generate Hand Meshes
+    for (let h = 0; h < CONFIG.MAX_HANDS; h++) {
+        let handGroup = new THREE.Group();
+        let joints = [];
+        let bones = [];
+
+        // Geometries
+        const jointGeo = new THREE.IcosahedronGeometry(0.4, 0);
+        const jointMat = new THREE.MeshBasicMaterial({ color: CONFIG.HAND_COLOR });
+
+        // Bones: White with transparency
+        const boneGeo = new THREE.CylinderGeometry(0.15, 0.15, 1, 6);
+        const boneMat = new THREE.MeshBasicMaterial({ color: CONFIG.HAND_COLOR, transparent: true, opacity: 0.3 });
+
+        // 21 Joints
+        for (let i = 0; i < 21; i++) {
+            let mesh = new THREE.Mesh(jointGeo, jointMat);
+            handGroup.add(mesh);
+            joints.push(mesh);
         }
+
+        // 25 Bones (Safe buffer for connections)
+        for (let i = 0; i < 25; i++) {
+            let bone = new THREE.Mesh(boneGeo, boneMat);
+            handGroup.add(bone);
+            bones.push(bone);
+        }
+
+        handGroup.visible = false;
+        scene.add(handGroup);
+        handMeshes.push({ joints, bones, group: handGroup });
     }
 
-    if (!cloudSuccess) projects = [...EMBEDDED_DB];
+    // Handle Resize (Restricted to Main Viewport)
+    window.addEventListener('resize', () => {
+        const w = mainViewport.clientWidth;
+        const h = mainViewport.clientHeight;
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+        renderer.setSize(w, h);
+    });
 
-    renderBoard();
-
-    // 2. Reset Status to Normal (White/Green) before revealing
-    updateStatusDisplay();
-
-    // 3. Reveal Content
-    setTimeout(() => {
-        if(loadingOverlay) loadingOverlay.classList.add('hidden');
-        if(mainContent) mainContent.classList.add('loaded');
-    }, 300);
+    renderLoop();
 }
 
-async function syncToCloud() {
-    if (!DB_URL || !DB_URL.startsWith('http')) return console.warn("No DB URL.");
-    if (!sessionToken) return console.warn("Cannot sync: No Auth Token.");
+// 2. Setup AI
+async function initMediaPipe() {
+    loadDetail.innerText = "Initializing Neural Core...";
 
-    flashStatus("TRANSMITTING...", "#FFFF00");
+    hands = new Hands({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+    }});
+
+    hands.setOptions({
+        maxNumHands: CONFIG.MAX_HANDS,
+        modelComplexity: 0, // Lite Model for speed
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+
+    hands.onResults(handleAIResults);
 
     try {
-        const response = await fetch(DB_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                auth: sessionToken,
-                data: projects
-            })
-        });
-
-        if (!response.ok) throw new Error(response.status);
-        setTimeout(() => flashStatus("SYNC COMPLETE", "#FFFFFF"), 500);
-    } catch (e) {
-        console.error(e);
-        const errCode = e.message === "Failed to fetch" ? "NETWORK" : "UNKNOWN";
-        flashStatus(`ERROR ${errCode}`, "#ff4444");
-    }
-}
-
-function updateStatusDisplay() {
-    if (!systemStatus) return;
-    if (isAuthenticated) {
-        systemStatus.innerText = "ADMINISTRATOR";
-        systemStatus.style.color = "#FFFFFF";
-        liveDot.style.backgroundColor = "#00FF00";
-        liveDot.style.boxShadow = "0 0 8px #00FF00";
-    } else {
-        systemStatus.innerText = "Viewing Mode";
-        systemStatus.style.color = "#888";
-        liveDot.style.backgroundColor = "#FFFFFF";
-        liveDot.style.boxShadow = "0 0 8px #FFFFFF";
-    }
-}
-
-function flashStatus(text, color) {
-    if (!systemStatus) return;
-    systemStatus.innerText = text;
-    systemStatus.style.color = color;
-    liveDot.style.backgroundColor = color;
-    liveDot.style.boxShadow = `0 0 8px ${color}`;
-
-    if (!text.includes("ERROR")) {
-        setTimeout(updateStatusDisplay, 2000);
-    }
-}
-
-// --- Rendering ---
-function renderBoard() {
-    SECTIONS.forEach(sec => {
-        const el = document.getElementById(sec);
-        if (el) el.innerHTML = '';
-    });
-    projects.forEach(createCardElement);
-}
-
-function createCardElement(p) {
-    const container = document.getElementById(p.section);
-    if (!container) return;
-
-    const div = document.createElement('div');
-    div.className = 'project-card';
-    div.setAttribute('data-id', p.id);
-
-    let actions = '';
-    if (isAuthenticated) {
-        actions = `
-            <div class="card-actions">
-                <button class="card-action-btn danger material-symbols-rounded" type="button" data-action="delete">delete</button>
-                <button class="card-action-btn material-symbols-rounded" type="button" data-action="edit">edit</button>
-            </div>
-        `;
-    }
-
-    const linkIcon = p.link ? '<span class="material-symbols-rounded card-link-icon">link</span>' : '';
-
-    div.innerHTML = `
-        ${actions}
-        <span class="card-title">${p.title} ${linkIcon}</span>
-        <div class="card-desc-wrapper">
-            <div class="card-desc-inner">
-                ${p.desc || 'No details.'}
-            </div>
-        </div>
-    `;
-
-    div.addEventListener('click', (e) => {
-        const actionBtn = e.target.closest('.card-action-btn');
-        if (actionBtn) {
-            e.stopPropagation();
-            const action = actionBtn.dataset.action;
-            if (action === 'edit') editProject(p.id);
-            if (action === 'delete') deleteProject(p.id);
-            return;
-        }
-        if (p.link) window.open(p.link, '_blank');
-    });
-
-    container.appendChild(div);
-}
-
-// --- Drag & Drop ---
-function initDragAndDrop() {
-    SECTIONS.forEach(secId => {
-        const el = document.getElementById(secId);
-        if (!el) return;
-        new Sortable(el, {
-            group: 'shared',
-            animation: 150,
-            disabled: !isAuthenticated,
-            ghostClass: 'sortable-ghost',
-            delay: 100, delayOnTouchOnly: true,
-            onEnd: (evt) => {
-                if(evt.from === evt.to && evt.oldIndex === evt.newIndex) return;
-                updateProjectStatus(evt.item.getAttribute('data-id'), evt.to.id);
+        loadDetail.innerText = "Requesting Optics...";
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+                width: { ideal: 640 },
+                height: { ideal: 480 },
+                facingMode: "user"
             }
         });
-    });
-}
 
-function updateProjectStatus(id, newSection) {
-    const p = projects.find(x => x.id === id);
-    if (p) {
-        p.section = newSection;
-        syncToCloud();
+        videoElement.srcObject = stream;
+
+        videoElement.onloadedmetadata = () => {
+            videoElement.play();
+            loadDetail.innerText = "Starting Uplink...";
+            startDetectionLoop();
+        };
+
+    } catch (err) {
+        console.error(err);
+        systemStatus.innerText = "SIGNAL LOST";
+        loadDetail.innerText = "Camera Access Denied";
+        // Visual indicator of failure
+        statusDot.style.backgroundColor = "#ff4444";
+        statusDot.classList.remove('active');
     }
 }
 
-// --- Authentication ---
-document.getElementById('authLink').addEventListener('click', (e) => {
-    e.preventDefault();
-    if (!isAuthenticated) document.getElementById('authModal').classList.remove('hidden');
-});
+// 3. The Detection Loop (Throttled to ~20ms)
+function startDetectionLoop() {
+    const loop = async () => {
+        const now = performance.now();
 
-async function authenticate() {
-    const input = document.getElementById('adminPassword');
-    const hash = await hashString(input.value);
+        if (videoElement.readyState >= 2 &&
+            !isProcessing &&
+            (now - lastLoopTime) >= CONFIG.UPDATE_INTERVAL) {
 
-    const validHash = (!TARGET_HASH.includes("ADMIN_HASH"))
-        ? TARGET_HASH
-        : "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918";
+            lastLoopTime = now;
+            isProcessing = true;
 
-    if (hash === validHash) {
-        isAuthenticated = true;
-        sessionToken = hash;
-        sessionStorage.setItem('lab_token', hash);
-        enableAdminMode();
-        closeModals();
-        input.value = '';
-    } else {
-        alert('ACCESS DENIED');
-        input.classList.add('error');
+            try {
+                await hands.send({ image: videoElement });
+            } catch (e) {
+                // Fail silently on dropped frames
+            }
+
+            isProcessing = false;
+        }
+
+        requestAnimationFrame(loop);
+    };
+    loop();
+}
+
+// 4. Handle Results (Update 3D Model)
+function handleAIResults(results) {
+    // Hide loader on first successful tracking
+    if (!loadingOverlay.classList.contains('hidden')) {
+        loadingOverlay.classList.add('hidden');
+        systemStatus.innerText = "UPLINK ESTABLISHED";
+        systemStatus.style.color = "var(--text-main)";
     }
-}
 
-async function hashString(msg) {
-    const data = new TextEncoder().encode(msg);
-    const hash = await crypto.subtle.digest('SHA-256', data);
-    return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
-}
+    // Calculate Latency
+    const now = performance.now();
+    fpsCounter.innerText = Math.round(now - lastLoopTime);
 
-function checkSession() {
-    const storedToken = sessionStorage.getItem('lab_token');
-    if (storedToken) {
-        sessionToken = storedToken;
-        isAuthenticated = true;
-        enableAdminMode();
-    }
-}
+    // Reset Visibility
+    handMeshes.forEach(h => h.group.visible = false);
 
-function enableAdminMode() {
-    document.body.classList.add('admin-view');
-    document.getElementById('adminControls').classList.remove('hidden');
-    updateStatusDisplay();
-    initDragAndDrop();
-    renderBoard();
-}
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        statusDot.classList.add('active');
 
-function logout() {
-    sessionStorage.removeItem('lab_token');
-    isAuthenticated = false;
-    sessionToken = null;
-    location.reload();
-}
+        results.multiHandLandmarks.forEach((landmarks, index) => {
+            if (index >= CONFIG.MAX_HANDS) return;
 
-// --- CRUD ---
-function openProjectModal(isEdit = false, id = null) {
-    const titleIn = document.getElementById('pTitle');
-    const linkIn = document.getElementById('pLink');
-    const descIn = document.getElementById('pDesc');
-    const idIn = document.getElementById('editId');
-    const label = document.getElementById('modalTitle');
+            const hand = handMeshes[index];
+            hand.group.visible = true;
 
-    if (isEdit && id) {
-        const p = projects.find(x => x.id === id);
-        titleIn.value = p.title;
-        linkIn.value = p.link || '';
-        descIn.value = p.desc || '';
-        idIn.value = id;
-        label.innerText = "Edit Protocol";
-    } else {
-        titleIn.value = ''; linkIn.value = ''; descIn.value = ''; idIn.value = '';
-        label.innerText = "New Protocol";
-    }
-    document.getElementById('projectModal').classList.remove('hidden');
-}
+            // Update Joints
+            landmarks.forEach((lm, i) => {
+                // Map Normalized (0-1) to World Space
+                const x = (0.5 - lm.x) * 20;
+                const y = (0.5 - lm.y) * 20;
+                const z = -lm.z * 20;
+                hand.joints[i].position.set(x, y, z);
+            });
 
-function editProject(id) { openProjectModal(true, id); }
+            // Update Bones
+            let boneIdx = 0;
+            connections.forEach(pair => {
+                const a = hand.joints[pair[0]].position;
+                const b = hand.joints[pair[1]].position;
+                const bone = hand.bones[boneIdx];
 
-function deleteProject(id) {
-    if (confirm("Are you sure you want to delete this protocol?")) {
-        projects = projects.filter(p => p.id !== id);
-        syncToCloud();
-        renderBoard();
-    }
-}
-
-function saveProject() {
-    const id = document.getElementById('editId').value;
-    const title = document.getElementById('pTitle').value;
-    const link = document.getElementById('pLink').value;
-    const desc = document.getElementById('pDesc').value;
-
-    if (!title) return alert("Title required");
-
-    if (id) {
-        const p = projects.find(x => x.id === id);
-        p.title = title; p.link = link; p.desc = desc;
-    } else {
-        projects.push({
-            id: Math.random().toString(36).substr(2, 9),
-            title, link, desc, section: 'ongoing'
+                if(bone) {
+                    bone.position.copy(a).add(b).multiplyScalar(0.5);
+                    bone.lookAt(b);
+                    bone.scale.set(1, 1, a.distanceTo(b));
+                    bone.rotateX(Math.PI / 2);
+                    bone.visible = true;
+                }
+                boneIdx++;
+            });
         });
+    } else {
+        statusDot.classList.remove('active');
     }
-
-    syncToCloud();
-    closeModals();
-    renderBoard();
 }
 
-function closeModals() {
-    document.querySelectorAll('.modal-overlay').forEach(m => m.classList.add('hidden'));
+// 5. Render Loop (Visuals Only)
+function renderLoop() {
+    requestAnimationFrame(renderLoop);
+    // Idle Animation
+    if (!statusDot.classList.contains('active')) {
+        scene.rotation.y = Math.sin(Date.now() * 0.0005) * 0.05;
+    }
+    renderer.render(scene, camera);
 }
