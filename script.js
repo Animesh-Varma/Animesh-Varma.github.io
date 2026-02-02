@@ -13,17 +13,35 @@ const CONFIG = {
     // AI Settings
     UPDATE_INTERVAL: 20,
     complexity: 1,
-    SMOOTHING_FACTOR: 0.6,
+    SMOOTHING_FACTOR: 0.5,
 
-    // Physics Thresholds
-    FIST_THRESHOLD: 6.0,      // Distance avg (Wrist to fingertips) to trigger "Fist"
-    DISPERSE_DISTANCE: 3.5,   // Distance between hands to trigger "Explosion"
+    // Hand Metrics (World Scale 20)
+    OPEN_HAND_SIZE: 9.0,
+    CLOSED_HAND_SIZE: 3.5,
 
-    // Swarm Settings
-    PARTICLE_COUNT: 2500,
-    MAX_SPEED: 0.9,           // Base speed
+    // Physics - Interaction
+    BASE_SPEED: 0.6,         // Speed when hand is Open
+    MAX_SPEED: 1.8,          // Speed when hand is Fist
+
+    // Gravity / Pull
+    MIN_COHESION: 0.01,      // Gentle pull (Open)
+    MAX_COHESION: 0.17,      // Strong Black Hole pull (Fist)
+
+    // Volume
+    MAX_RADIUS: 13.0,        // Swarm size (Open)
+    MIN_RADIUS: 0.5,         // Swarm size (Fist)
+
+    // Explosion
+    EXPLOSION_FORCE: 2.0,
+    EXPLOSION_COOLDOWN: 500,
+    DISPERSE_DISTANCE: 2.0,
+
+    // Idle / Decay
+    IDLE_RETURN_FORCE: 0.005,
+    IDLE_FRICTION: 0.98,
 
     // Visuals
+    PARTICLE_COUNT: 2500,
     PARTICLE_COLOR: 0x00ff9d,
     HAND_COLOR: 0xFFFFFF,
     MAX_HANDS: 2,
@@ -48,6 +66,13 @@ let hands;
 let particles, particleGeo, particleData;
 let isProcessing = false;
 let lastLoopTime = 0;
+
+// Reusable Vectors (Memory Optimization)
+const _vPos = new THREE.Vector3();
+const _vVel = new THREE.Vector3();
+const _vTarget = new THREE.Vector3();
+const _vSteer = new THREE.Vector3();
+const _vTemp = new THREE.Vector3(); // Fixed: Added missing definition
 
 // --- Initialization ---
 initThreeJS();
@@ -75,7 +100,6 @@ function initThreeJS() {
 
     // Create Hands
     for (let h = 0; h < CONFIG.MAX_HANDS; h++) {
-        // Visuals
         let handGroup = new THREE.Group();
         let joints = [];
         let bones = [];
@@ -100,14 +124,15 @@ function initThreeJS() {
         scene.add(handGroup);
         handMeshes.push({ joints, bones, group: handGroup });
 
-        // Logic State
         handState.push({
             active: false,
             center: new THREE.Vector3(),
             velocity: new THREE.Vector3(),
             prevCenter: new THREE.Vector3(),
             targets: Array(21).fill().map(() => new THREE.Vector3()),
-            isFist: false // New State
+            clenchFactor: 0.0,
+            isExploding: false,
+            lastExplosionTime: 0
         });
     }
 
@@ -128,19 +153,17 @@ function createSwarmParticles() {
     particleData = [];
 
     for (let i = 0; i < CONFIG.PARTICLE_COUNT; i++) {
-        const x = (Math.random() - 0.5) * 80;
-        const y = (Math.random() - 0.5) * 60;
-        const z = (Math.random() - 0.5) * 40;
+        const x = (Math.random() - 0.5) * 100;
+        const y = (Math.random() - 0.5) * 80;
+        const z = (Math.random() - 0.5) * 60;
         positions.push(x, y, z);
 
         particleData.push({
             velocity: new THREE.Vector3(
-                (Math.random() - 0.5) * 0.5,
-                (Math.random() - 0.5) * 0.5,
-                (Math.random() - 0.5) * 0.5
-            ),
+                Math.random()-0.5, Math.random()-0.5, Math.random()-0.5
+            ).normalize(),
             offset: Math.random() * 100,
-            speedVar: 0.5 + Math.random() * 0.8
+            speedVar: 0.8 + Math.random() * 0.4
         });
     }
 
@@ -161,7 +184,7 @@ function createSwarmParticles() {
 
 // 2. Setup AI
 async function initMediaPipe() {
-    loadDetail.innerText = "Loading Neural Physics...";
+    loadDetail.innerText = "Loading Swarm Logic...";
 
     hands = new Hands({locateFile: (file) => {
         return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
@@ -225,10 +248,8 @@ function handleAIResults(results) {
         statusDot.classList.add('active');
         results.multiHandLandmarks.forEach((landmarks, index) => {
             if (index >= CONFIG.MAX_HANDS) return;
-
             const state = handState[index];
             state.active = true;
-
             landmarks.forEach((lm, i) => {
                 const x = (0.5 - lm.x) * CONFIG.WORLD_SCALE;
                 const y = (0.5 - lm.y) * CONFIG.WORLD_SCALE;
@@ -241,7 +262,7 @@ function handleAIResults(results) {
     }
 }
 
-// 5. Render Loop (Visuals + Logic)
+// 5. Render Loop
 function renderLoop() {
     requestAnimationFrame(renderLoop);
     const now = Date.now();
@@ -254,12 +275,10 @@ function renderLoop() {
         if (state.active) {
             visual.group.visible = true;
 
-            // Update Joints
+            // Joints Lerp
             for (let j = 0; j < 21; j++) {
                 visual.joints[j].position.lerp(state.targets[j], CONFIG.SMOOTHING_FACTOR);
             }
-
-            // Update Bones
             connections.forEach((pair, boneIdx) => {
                 const a = visual.joints[pair[0]].position;
                 const b = visual.joints[pair[1]].position;
@@ -272,24 +291,33 @@ function renderLoop() {
                 }
             });
 
-            // Physics Stats
-            // Center = Palm
+            // State Updates
             state.center.copy(visual.joints[0].position).add(visual.joints[9].position).multiplyScalar(0.5);
             state.velocity.subVectors(state.center, state.prevCenter);
             state.prevCenter.copy(state.center);
 
-            // --- FIST DETECTION ---
-            // Calculate avg distance from Wrist(0) to Tips(8,12,16,20)
+            // --- Clench Calculation ---
             const wrist = visual.joints[0].position;
-            const tips = [8, 12, 16, 20];
+            const tips = [4, 8, 12, 16, 20];
             let totalDist = 0;
-            tips.forEach(idx => {
-                totalDist += wrist.distanceTo(visual.joints[idx].position);
-            });
-            const avgDist = totalDist / 4;
+            tips.forEach(idx => { totalDist += wrist.distanceTo(visual.joints[idx].position); });
+            const avgDist = totalDist / 5;
+            let rawClench = (CONFIG.OPEN_HAND_SIZE - avgDist) / (CONFIG.OPEN_HAND_SIZE - CONFIG.CLOSED_HAND_SIZE);
+            state.clenchFactor = Math.max(0, Math.min(1, rawClench));
 
-            // Hysteresis or simple threshold
-            state.isFist = avgDist < CONFIG.FIST_THRESHOLD;
+            // --- Gesture Detection (Shooter / Three) ---
+            const dRing = wrist.distanceTo(visual.joints[16].position);
+            const dPinky = wrist.distanceTo(visual.joints[20].position);
+            const dIndex = wrist.distanceTo(visual.joints[8].position);
+
+            // Heuristic: Ring/Pinky Closed (<4.5) AND Index Open (>5.5)
+            const isShooterPose = (dRing < 4.5 && dPinky < 4.5 && dIndex > 5.5);
+
+            if (isShooterPose && !state.isExploding && (now - state.lastExplosionTime > CONFIG.EXPLOSION_COOLDOWN)) {
+                state.isExploding = true;
+                state.lastExplosionTime = now;
+                setTimeout(() => { state.isExploding = false; }, 200);
+            }
 
         } else {
             visual.group.visible = false;
@@ -314,117 +342,119 @@ function updateBoids(time) {
     const count = CONFIG.PARTICLE_COUNT;
     const activeHands = handState.filter(h => h.active);
 
-    const vPos = new THREE.Vector3();
-    const vTarget = new THREE.Vector3();
-    const vSteer = new THREE.Vector3();
+    // Mode determination
+    let mode = "IDLE";
+    let attractorVec = _vTemp.set(0,0,0);
 
+    // Dynamic Physics Variables
+    let currentMaxSpeed = CONFIG.BASE_SPEED;
+    let currentCohesion = CONFIG.MIN_COHESION;
+    let targetRadius = CONFIG.MAX_RADIUS;
+
+    if (activeHands.length === 0) {
+        mode = "IDLE";
+    } else if (activeHands.length === 1) {
+        mode = "SINGLE";
+        const h = activeHands[0];
+
+        if (h.isExploding) {
+            mode = "EXPLODE";
+            attractorVec.copy(h.center);
+        } else {
+            attractorVec.copy(h.center);
+
+            // --- ANALOG ACCELERATION ---
+            currentMaxSpeed = CONFIG.BASE_SPEED + (h.clenchFactor * (CONFIG.MAX_SPEED - CONFIG.BASE_SPEED));
+            targetRadius = CONFIG.MAX_RADIUS - (h.clenchFactor * (CONFIG.MAX_RADIUS - CONFIG.MIN_RADIUS));
+            currentCohesion = CONFIG.MIN_COHESION + (h.clenchFactor * (CONFIG.MAX_COHESION - CONFIG.MIN_COHESION));
+        }
+    } else {
+        const h1 = activeHands[0];
+        const h2 = activeHands[1];
+        const dist = h1.center.distanceTo(h2.center);
+        const mid = _vTemp.copy(h1.center).add(h2.center).multiplyScalar(0.5);
+
+        if (dist < CONFIG.DISPERSE_DISTANCE) {
+            mode = "EXPLODE";
+            attractorVec.copy(mid);
+        } else {
+            mode = "DUAL";
+            attractorVec.copy(mid);
+            const avgClench = (h1.clenchFactor + h2.clenchFactor) / 2;
+            currentMaxSpeed = CONFIG.BASE_SPEED + (avgClench * (CONFIG.MAX_SPEED - CONFIG.BASE_SPEED));
+            targetRadius = Math.max(CONFIG.MIN_RADIUS, Math.min(CONFIG.MAX_RADIUS, dist * 0.6));
+        }
+    }
+
+    // Optimized Loop
     for (let i = 0; i < count; i++) {
         let ix = i * 3;
-        vPos.set(positions[ix], positions[ix+1], positions[ix+2]);
         const pData = particleData[i];
 
-        let mode = "IDLE"; // IDLE, SINGLE, DUAL, EXPLODE
-        let targetRadius = 5.0; // How spread out the swarm is
-
-        // 1. Determine Mode & Target
-        if (activeHands.length === 0) {
-            // IDLE
-            vTarget.set(
-                Math.sin(time * 0.5 + pData.offset) * 15,
-                Math.cos(time * 0.3 + pData.offset) * 10,
-                Math.sin(time * 0.2) * 5
-            );
-        } else if (activeHands.length === 1) {
-            // SINGLE HAND
-            const h = activeHands[0];
-            vTarget.copy(h.center);
-
-            if (h.isFist) {
-                // TIGHT: Condensed Energy
-                targetRadius = 1.5;
-            } else {
-                // LOOSE: Bird Swarm
-                targetRadius = 8.0;
-            }
-        } else {
-            // DUAL HANDS (Sphere Between)
-            const h1 = activeHands[0];
-            const h2 = activeHands[1];
-            const dist = h1.center.distanceTo(h2.center);
-            const midPoint = new THREE.Vector3().addVectors(h1.center, h2.center).multiplyScalar(0.5);
-
-            if (dist < CONFIG.DISPERSE_DISTANCE) {
-                // TOO CLOSE -> EXPLODE
-                mode = "EXPLODE";
-                vTarget.copy(midPoint); // Origin of explosion
-            } else {
-                // SPHERE FORMATION
-                // The sphere radius depends on hand distance
-                // Far hands = Big Sphere. Close hands = Tight Sphere.
-                targetRadius = dist * 0.6;
-                vTarget.copy(midPoint);
-            }
-        }
-
-        // 2. Calculate Forces
-        const distToTarget = vPos.distanceTo(vTarget);
+        // Read Position
+        _vPos.set(positions[ix], positions[ix+1], positions[ix+2]);
+        _vVel.copy(pData.velocity);
 
         if (mode === "EXPLODE") {
-            // --- EXPLOSION LOGIC ---
-            // Repel strongly from center
-            vSteer.subVectors(vPos, vTarget).normalize().multiplyScalar(CONFIG.MAX_SPEED * 3.0);
-
-        } else {
-            // --- SWARM LOGIC ---
-
-            // Vector pointing to target center
-            const vecToCenter = new THREE.Vector3().subVectors(vTarget, vPos);
-
-            // "Orbit" Force: Push perpendicular to center vector to create rotation
-            // Cross product with UP vector usually works for simple orbit
-            const orbitDir = new THREE.Vector3(-vecToCenter.z, vecToCenter.y, vecToCenter.x).normalize();
-
-            // Distance Check
-            if (distToTarget > targetRadius) {
-                // Too far? Pull In (Cohesion)
-                vSteer.copy(vecToCenter).normalize().multiplyScalar(CONFIG.MAX_SPEED);
-            } else {
-                // Inside radius?
-                // 1. Maintain orbit (Swirl)
-                vSteer.copy(orbitDir).multiplyScalar(CONFIG.MAX_SPEED * 0.8);
-
-                // 2. Slight repulsion if TOO close to center (Hollow shell effect)
-                if (distToTarget < targetRadius * 0.3) {
-                     const pushOut = vecToCenter.clone().negate().normalize().multiplyScalar(CONFIG.MAX_SPEED * 0.5);
-                     vSteer.add(pushOut);
-                }
-            }
+            _vSteer.subVectors(_vPos, attractorVec).normalize().multiplyScalar(CONFIG.EXPLOSION_FORCE);
+            _vVel.add(_vSteer);
         }
+        else if (mode === "IDLE") {
+            // Decay Logic
+            _vTarget.set(
+                Math.sin(time * 0.5 + pData.offset) * 20,
+                Math.cos(time * 0.3 + pData.offset) * 15,
+                Math.sin(time * 0.2) * 10
+            );
 
-        // 3. Noise / Jitter (Bird-like randomness)
-        vSteer.x += (Math.random() - 0.5) * 0.15;
-        vSteer.y += (Math.random() - 0.5) * 0.15;
-        vSteer.z += (Math.random() - 0.5) * 0.15;
+            _vSteer.subVectors(_vTarget, _vPos).multiplyScalar(CONFIG.IDLE_RETURN_FORCE);
+            _vVel.add(_vSteer);
 
-        // 4. Physics Integration
-        // Add Steering to Velocity
-        pData.velocity.add(vSteer.multiplyScalar(0.05)); // Inertia factor
+            _vVel.x += (Math.random()-0.5) * 0.01;
+            _vVel.y += (Math.random()-0.5) * 0.01;
+            _vVel.z += (Math.random()-0.5) * 0.01;
 
-        // Clamp Speed
-        const speedLimit = mode === "EXPLODE" ? CONFIG.MAX_SPEED * 3 : CONFIG.MAX_SPEED * pData.speedVar;
-        pData.velocity.clampLength(0, speedLimit);
+            _vVel.multiplyScalar(CONFIG.IDLE_FRICTION);
+        }
+        else {
+            // INTERACTION
+            const distToCenter = _vPos.distanceTo(attractorVec);
+            _vTarget.subVectors(attractorVec, _vPos);
+
+            // Variable Cohesion
+            if (distToCenter > targetRadius) {
+                _vSteer.copy(_vTarget).normalize().multiplyScalar(currentCohesion);
+            } else {
+                _vSteer.copy(_vTarget).negate().normalize().multiplyScalar(0.01);
+            }
+            _vVel.add(_vSteer);
+
+            // Chaos reduces as hand closes
+            const chaosFactor = 0.08 * (1.0 - (currentCohesion * 5));
+            _vSteer.set(
+                Math.sin(time * 2.0 + _vPos.y * 0.1 + pData.offset),
+                Math.cos(time * 1.5 + _vPos.z * 0.1 + pData.offset),
+                Math.sin(time * 2.5 + _vPos.x * 0.1)
+            ).multiplyScalar(Math.max(0, chaosFactor));
+            _vVel.add(_vSteer);
+
+            // Hand Drag
+            if (activeHands.length === 1) {
+                _vVel.add(activeHands[0].velocity.clone().multiplyScalar(0.1));
+            }
+
+            _vVel.multiplyScalar(0.96);
+            _vVel.clampLength(0, currentMaxSpeed * pData.speedVar);
+        }
 
         // Move
-        vPos.add(pData.velocity);
+        _vPos.add(_vVel);
 
-        // 5. Hand Drag (If single hand)
-        if (activeHands.length === 1) {
-            vPos.add(activeHands[0].velocity.clone().multiplyScalar(0.2));
-        }
-
-        positions[ix] = vPos.x;
-        positions[ix+1] = vPos.y;
-        positions[ix+2] = vPos.z;
+        // Write Back
+        positions[ix] = _vPos.x;
+        positions[ix+1] = _vPos.y;
+        positions[ix+2] = _vPos.z;
+        pData.velocity.copy(_vVel);
     }
 
     particleGeo.attributes.position.needsUpdate = true;
