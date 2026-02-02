@@ -15,13 +15,16 @@ const CONFIG = {
     complexity: 1,
     SMOOTHING_FACTOR: 0.5,
 
-    // Hand Metrics (World Scale 20)
-    OPEN_HAND_SIZE: 9.0,
-    CLOSED_HAND_SIZE: 3.5,
+    // Hand Metrics (RATIOS, not absolute units)
+    // Scale Ref = Distance from Wrist(0) to Middle Knuckle(9)
+    // If fingertip distance / Scale Ref > OPEN_RATIO -> Hand is Open
+    // If fingertip distance / Scale Ref < CLOSED_RATIO -> Hand is Closed
+    OPEN_RATIO: 2.2,
+    CLOSED_RATIO: 1.3,
 
     // Physics - Interaction
     BASE_SPEED: 0.6,         // Speed when hand is Open
-    MAX_SPEED: 1.8,          // Speed when hand is Fist
+    MAX_SPEED: 2.0,          // Speed when hand is Fist
 
     // Gravity / Pull
     MIN_COHESION: 0.01,      // Gentle pull (Open)
@@ -67,12 +70,12 @@ let particles, particleGeo, particleData;
 let isProcessing = false;
 let lastLoopTime = 0;
 
-// Reusable Vectors (Memory Optimization)
+// Reusable Vectors
 const _vPos = new THREE.Vector3();
 const _vVel = new THREE.Vector3();
 const _vTarget = new THREE.Vector3();
 const _vSteer = new THREE.Vector3();
-const _vTemp = new THREE.Vector3(); // Fixed: Added missing definition
+const _vTemp = new THREE.Vector3();
 
 // --- Initialization ---
 initThreeJS();
@@ -184,7 +187,7 @@ function createSwarmParticles() {
 
 // 2. Setup AI
 async function initMediaPipe() {
-    loadDetail.innerText = "Loading Swarm Logic...";
+    loadDetail.innerText = "Loading Scale-Invariant Core...";
 
     hands = new Hands({locateFile: (file) => {
         return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
@@ -291,29 +294,59 @@ function renderLoop() {
                 }
             });
 
-            // State Updates
+            // Update Physics Center
             state.center.copy(visual.joints[0].position).add(visual.joints[9].position).multiplyScalar(0.5);
             state.velocity.subVectors(state.center, state.prevCenter);
             state.prevCenter.copy(state.center);
 
-            // --- Clench Calculation ---
+            // --- SCALE-INVARIANT CALCULATIONS ---
             const wrist = visual.joints[0].position;
+            const midKnuckle = visual.joints[9].position;
+
+            // 1. Calculate Hand Scale (Reference Size)
+            // This distance (wrist to middle knuckle) is relatively stable regardless of pose
+            const handScale = wrist.distanceTo(midKnuckle);
+
+            // 2. Calculate Clench (Normalized)
             const tips = [4, 8, 12, 16, 20];
             let totalDist = 0;
             tips.forEach(idx => { totalDist += wrist.distanceTo(visual.joints[idx].position); });
             const avgDist = totalDist / 5;
-            let rawClench = (CONFIG.OPEN_HAND_SIZE - avgDist) / (CONFIG.OPEN_HAND_SIZE - CONFIG.CLOSED_HAND_SIZE);
+
+            // Ratio: TipDist / Scale.
+            // Open ~2.5x, Closed ~1.0x
+            const ratio = avgDist / (handScale || 1); // Avoid div/0
+
+            // Map Ratio range to 0..1 Clench
+            // e.g., (2.2 - Ratio) / (2.2 - 1.3)
+            let rawClench = (CONFIG.OPEN_RATIO - ratio) / (CONFIG.OPEN_RATIO - CONFIG.CLOSED_RATIO);
             state.clenchFactor = Math.max(0, Math.min(1, rawClench));
 
-            // --- Gesture Detection (Shooter / Three) ---
-            const dRing = wrist.distanceTo(visual.joints[16].position);
-            const dPinky = wrist.distanceTo(visual.joints[20].position);
-            const dIndex = wrist.distanceTo(visual.joints[8].position);
+            // --- GESTURE TRIGGER (NORMALIZED) ---
+            // Trigger: Thumb(4), Index(8), Mid(12) OPEN. Ring(16), Pinky(20) CLOSED.
+            // Using Normalized Ratios instead of Absolute Distance
 
-            // Heuristic: Ring/Pinky Closed (<4.5) AND Index Open (>5.5)
-            const isShooterPose = (dRing < 4.5 && dPinky < 4.5 && dIndex > 5.5);
+            const rThumb = wrist.distanceTo(visual.joints[4].position) / handScale;
+            const rIndex = wrist.distanceTo(visual.joints[8].position) / handScale;
+            const rMid   = wrist.distanceTo(visual.joints[12].position) / handScale;
+            const rRing  = wrist.distanceTo(visual.joints[16].position) / handScale;
+            const rPinky = wrist.distanceTo(visual.joints[20].position) / handScale;
 
-            if (isShooterPose && !state.isExploding && (now - state.lastExplosionTime > CONFIG.EXPLOSION_COOLDOWN)) {
+            // Thresholds
+            // Open > 1.8x Scale (conservative)
+            // Closed < 1.4x Scale (conservative)
+            const isOpenRef = 1.8;
+            const isClosedRef = 1.4;
+
+            const isShooter = (
+                rThumb > isOpenRef &&
+                rIndex > isOpenRef &&
+                rMid   > isOpenRef &&
+                rRing  < isClosedRef &&
+                rPinky < isClosedRef
+            );
+
+            if (isShooter && !state.isExploding && (now - state.lastExplosionTime > CONFIG.EXPLOSION_COOLDOWN)) {
                 state.isExploding = true;
                 state.lastExplosionTime = now;
                 setTimeout(() => { state.isExploding = false; }, 200);
@@ -346,7 +379,7 @@ function updateBoids(time) {
     let mode = "IDLE";
     let attractorVec = _vTemp.set(0,0,0);
 
-    // Dynamic Physics Variables
+    // Physics Vars
     let currentMaxSpeed = CONFIG.BASE_SPEED;
     let currentCohesion = CONFIG.MIN_COHESION;
     let targetRadius = CONFIG.MAX_RADIUS;
@@ -363,7 +396,7 @@ function updateBoids(time) {
         } else {
             attractorVec.copy(h.center);
 
-            // --- ANALOG ACCELERATION ---
+            // ANALOG ACCELERATION
             currentMaxSpeed = CONFIG.BASE_SPEED + (h.clenchFactor * (CONFIG.MAX_SPEED - CONFIG.BASE_SPEED));
             targetRadius = CONFIG.MAX_RADIUS - (h.clenchFactor * (CONFIG.MAX_RADIUS - CONFIG.MIN_RADIUS));
             currentCohesion = CONFIG.MIN_COHESION + (h.clenchFactor * (CONFIG.MAX_COHESION - CONFIG.MIN_COHESION));
@@ -391,7 +424,7 @@ function updateBoids(time) {
         let ix = i * 3;
         const pData = particleData[i];
 
-        // Read Position
+        // Read
         _vPos.set(positions[ix], positions[ix+1], positions[ix+2]);
         _vVel.copy(pData.velocity);
 
@@ -400,7 +433,7 @@ function updateBoids(time) {
             _vVel.add(_vSteer);
         }
         else if (mode === "IDLE") {
-            // Decay Logic
+            // Decay
             _vTarget.set(
                 Math.sin(time * 0.5 + pData.offset) * 20,
                 Math.cos(time * 0.3 + pData.offset) * 15,
@@ -421,7 +454,7 @@ function updateBoids(time) {
             const distToCenter = _vPos.distanceTo(attractorVec);
             _vTarget.subVectors(attractorVec, _vPos);
 
-            // Variable Cohesion
+            // Cohesion (Pull)
             if (distToCenter > targetRadius) {
                 _vSteer.copy(_vTarget).normalize().multiplyScalar(currentCohesion);
             } else {
@@ -429,7 +462,7 @@ function updateBoids(time) {
             }
             _vVel.add(_vSteer);
 
-            // Chaos reduces as hand closes
+            // Chaos (Reduces on Clench)
             const chaosFactor = 0.08 * (1.0 - (currentCohesion * 5));
             _vSteer.set(
                 Math.sin(time * 2.0 + _vPos.y * 0.1 + pData.offset),
@@ -447,10 +480,8 @@ function updateBoids(time) {
             _vVel.clampLength(0, currentMaxSpeed * pData.speedVar);
         }
 
-        // Move
+        // Move & Save
         _vPos.add(_vVel);
-
-        // Write Back
         positions[ix] = _vPos.x;
         positions[ix+1] = _vPos.y;
         positions[ix+2] = _vPos.z;
