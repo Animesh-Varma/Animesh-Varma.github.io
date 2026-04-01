@@ -200,19 +200,52 @@ function initDragAndDrop() {
             ghostClass: 'sortable-ghost',
             delay: 100, delayOnTouchOnly: true,
             onEnd: (evt) => {
+                // If the item wasn't moved at all, do nothing.
                 if(evt.from === evt.to && evt.oldIndex === evt.newIndex) return;
-                updateProjectStatus(evt.item.getAttribute('data-id'), evt.to.id);
+
+                // Triggers a total re-read of the UI state to save new Index / Arrays
+                rebuildProjectState();
             }
         });
     });
 }
 
-function updateProjectStatus(id, newSection) {
-    const p = projects.find(x => x.id === id);
-    if (p) {
-        p.section = newSection;
-        syncToCloud();
-    }
+// Non-destructive Indexing logic:
+// Rebuilds the JSON Array to exactly match the current top-to-bottom DOM order.
+function rebuildProjectState() {
+    const reorderedProjects = [];
+
+    // Loop through columns in standard order
+    SECTIONS.forEach(secId => {
+        const container = document.getElementById(secId);
+        if (!container) return;
+
+        // Fetch all physical cards currently residing inside this column
+        const cards = container.querySelectorAll('.project-card');
+
+        // Push them to the new array in the exact order they appear in the UI
+        cards.forEach(card => {
+            const cardId = card.getAttribute('data-id');
+            const p = projects.find(x => x.id === cardId);
+            if (p) {
+                p.section = secId; // Guarantee section matches drop zone
+                reorderedProjects.push(p);
+            }
+        });
+    });
+
+    // Fallback: If any project somehow wasn't rendered, append it to prevent data loss.
+    projects.forEach(p => {
+        if (!reorderedProjects.includes(p)) {
+            reorderedProjects.push(p);
+        }
+    });
+
+    // Overwrite old array order with new visual array order
+    projects = reorderedProjects;
+
+    // Transmit to Cloudflare KV
+    syncToCloud();
 }
 
 // --- Authentication ---
