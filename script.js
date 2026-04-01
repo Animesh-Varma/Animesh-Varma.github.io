@@ -160,12 +160,15 @@ function createCardElement(p) {
 
     const linkIcon = p.link ? '<span class="material-symbols-rounded card-link-icon">link</span>' : '';
 
+    const rawDesc = p.desc || 'No details.';
+    const formattedDesc = rawDesc.replace(/\r?\n/g, '<br>');
+
     div.innerHTML = `
         ${actions}
         <span class="card-title">${p.title} ${linkIcon}</span>
         <div class="card-desc-wrapper">
             <div class="card-desc-inner">
-                ${p.desc || 'No details.'}
+                ${formattedDesc}
             </div>
         </div>
     `;
